@@ -1,0 +1,125 @@
+name: Backend CI/CD Pipeline
+
+# Activar el workflow cuando se realiza un push a cualquier rama que tenga un PR abierto
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - '**'
+
+jobs:
+  # Job 1: Ejecutar tests
+  test:
+    name: Test Backend
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+      
+      - name: Generate Prisma client
+        working-directory: backend
+        run: npm run prisma:generate
+      
+      - name: Run tests
+        working-directory: backend
+        run: npm test
+
+  # Job 2: Construir la aplicación
+  build:
+    name: Build Backend
+    needs: test  # Este job se ejecuta solo si el job de test es exitoso
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+      
+      - name: Generate Prisma client
+        working-directory: backend
+        run: npm run prisma:generate
+      
+      - name: Build
+        working-directory: backend
+        run: npm run build
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: backend-build
+          path: backend/dist/
+          retention-days: 1
+
+  # Job 3: Desplegar en AWS EC2 (en PRs contra main)
+  deploy:
+    name: Deploy to AWS EC2
+    needs: build  # Este job se ejecuta solo si el job de build es exitoso
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'  # Desplegar en PRs contra main
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: backend-build
+          path: backend/dist/
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Copy package files
+        run: |
+          mkdir -p deploy
+          cp backend/package.json deploy/
+          cp backend/package-lock.json deploy/
+          cp -r backend/dist deploy/
+      
+      - name: Deploy to EC2 instance
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "deploy/*"
+          target: "/home/${{ secrets.EC2_USERNAME }}/app"
+      
+      - name: Restart application
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/${{ secrets.EC2_USERNAME }}/app/deploy
+            npm ci --production
+            pm2 restart backend || pm2 start dist/index.js --name backend 
